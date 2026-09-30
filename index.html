@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Waste Classifier</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#203a43">
+
+  <!-- TensorFlow.js & Teachable Machine -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+      color: white;
+      text-align: center;
+    }
+
+    h1 {
+      margin-top: 15px;
+      font-size: 22px;
+    }
+
+    #container {
+      padding: 15px;
+    }
+
+    video {
+      width: 100%;
+      max-width: 320px;
+      border-radius: 12px;
+      border: 3px solid #00e676;
+      margin-top: 10px;
+    }
+
+    #result {
+      margin-top: 15px;
+      font-size: 26px;
+      font-weight: bold;
+      padding: 14px;
+      border-radius: 10px;
+    }
+
+    .dry { background: #2196f3; }
+    .wet { background: #4caf50; }
+
+    #confidence {
+      margin-top: 8px;
+      font-size: 15px;
+      opacity: 0.9;
+    }
+
+    .ble-btn {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 8px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 20px;
+      border: none;
+      background: #ff9800;
+      color: black;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+      z-index: 9999;
+    }
+
+    .ble-status {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 13px;
+      color: #00e676;
+      opacity: 0.9;
+    }
+
+    footer {
+      margin-top: 20px;
+      font-size: 12px;
+      opacity: 0.7;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>AI Dry / Wet Waste Classifier</h1>
+
+<div id="container">
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="result">Loading AI...</div>
+  <div id="confidence"></div>
+</div>
+
+<footer>
+  • ICTSM Lakhani • AI-Based Waste Segregation •
+</footer>
+
+<button id="bleBtn" class="ble-btn">🔗 Connect to ESP32</button>
+<div id="bleStatus" class="ble-status"></div>
+
+<script>
+  const MODEL_URL = "./tm-model/";
+  let model, video;
+  let lastSent = "";
+
+  let bleDevice = null;
+  let bleCharacteristic = null;
+
+  const SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
+  const CHARACTERISTIC_UUID = "abcd1234-5678-90ab-cdef-1234567890ab";
+
+  /* ================= BLE ================= */
+
+  async function connectBLE() {
+    try {
+      bleDevice = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [SERVICE_UUID]
+      });
+
+      const server = await bleDevice.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      bleCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+      // UI update
+      document.getElementById("bleBtn").style.display = "none";
+      document.getElementById("bleStatus").innerText = "ESP32 Connected ✔";
+
+      // Handle disconnect
+      bleDevice.addEventListener("gattserverdisconnected", () => {
+        bleCharacteristic = null;
+        document.getElementById("bleBtn").style.display = "block";
+        document.getElementById("bleStatus").innerText = "ESP32 Disconnected";
+      });
+
+    } catch (error) {
+      alert("BLE connection failed: " + error.message);
+      console.error(error);
+    }
+  }
+
+  document.getElementById("bleBtn").addEventListener("click", connectBLE);
+
+  // Clean disconnect on refresh / close
+  window.addEventListener("beforeunload", () => {
+    if (bleDevice && bleDevice.gatt.connected) {
+      bleDevice.gatt.disconnect();
+    }
+  });
+
+  function sendToESP32(value) {
+    if (!bleCharacteristic) return;
+    bleCharacteristic.writeValue(new TextEncoder().encode(value));
+  }
+
+  /* ================= INIT ================= */
+
+  async function init() {
+    try {
+      model = await tmImage.load(
+        MODEL_URL + "model.json",
+        MODEL_URL + "metadata.json"
+      );
+
+      video = document.getElementById("webcam");
+
+      // Ask camera permission once
+      let tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      tempStream.getTracks().forEach(t => t.stop());
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter(d => d.kind === "videoinput");
+
+      let rearCam = cams.find(d =>
+        d.label.toLowerCase().includes("back") ||
+        d.label.toLowerCase().includes("rear")
+      ) || cams[cams.length - 1];
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: rearCam.deviceId } }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      document.getElementById("result").innerText = "AI Ready";
+      setInterval(predict, 800);
+
+    } catch (err) {
+      alert("Camera / AI error: " + err.message);
+      console.error(err);
+    }
+  }
+
+  /* ================= PREDICT ================= */
+
+  async function predict() {
+    const prediction = await model.predict(video);
+    prediction.sort((a, b) => b.probability - a.probability);
+
+    const label = prediction[0].className.toLowerCase();
+    const conf = (prediction[0].probability * 100).toFixed(1);
+
+    const result = document.getElementById("result");
+    const confidence = document.getElementById("confidence");
+
+    if (label.includes("dry")) {
+      result.innerText = "DRY WASTE";
+      result.className = "dry";
+      if (lastSent !== "D") {
+        sendToESP32("D");
+        lastSent = "D";
+      }
+    } 
+    else if (label.includes("wet")) {
+      result.innerText = "WET WASTE";
+      result.className = "wet";
+      if (lastSent !== "W") {
+        sendToESP32("W");
+        lastSent = "W";
+      }
+    }
+
+    confidence.innerText = "Confidence: " + conf + "%";
+  }
+
+  window.onload = init;
+</script>
+
+</body>
+</html>
